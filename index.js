@@ -4,6 +4,7 @@ import '@shopify/shopify-api/adapters/node';
 import { shopifyApi, LATEST_API_VERSION, LogSeverity } from '@shopify/shopify-api';
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import sharp from 'sharp';
+import JSZip from 'jszip';
 
 // --- INITIALIZE CLIENTS ---
 const shopify = shopifyApi({
@@ -71,7 +72,7 @@ const registerWebhook = async (shop, accessToken) => {
   }
 };
 
-// --- WEBHOOK HANDLER (AWS & SHARP VERSION) ---
+// --- WEBHOOK HANDLER (PDF & ZIP VERSION) ---
 const webhookHandler = async (topic, shop, body) => {
   console.log(`🎉 Webhook received for topic: ${topic}`);
   const payload = JSON.parse(body);
@@ -88,82 +89,126 @@ const webhookHandler = async (topic, shop, body) => {
         const callSign = prop.value;
         console.log(`Found Call Sign "${callSign}" for line item ID: ${item.id}`);
 
-        const baseFilename = item.title.toLowerCase().replace(/\s+/g, '');
+        // 1. Construct and download the template ZIP from S3
+        // This now generates the filename in all caps with underscores
+        const baseFilename = item.title.toUpperCase().replace(/\s+/g, '_').replace('-', '--');
         const variantTitle = item.variant_title.toLowerCase();
         let templateKey;
+
         if (variantTitle.includes('white') || variantTitle.includes('golden yellow')) {
-          templateKey = `${baseFilename}-forlight.png`;
+            templateKey = `${baseFilename}_FOR_LIGHT.zip`;
         } else {
-          templateKey = `${baseFilename}-fordark.png`;
+            templateKey = `${baseFilename}_FOR_DARK.zip`;
         }
-        console.log(`Variant is "${item.variant_title}", searching for template in S3: ${templateKey}`);
-
-        const getObjectParams = {
-          Bucket: process.env.AWS_TEMPLATES_BUCKET,
-          Key: templateKey,
-        };
+        console.log(`Searching for template ZIP in S3: ${templateKey}`);
+        
+        const getObjectParams = { Bucket: process.env.AWS_TEMPLATES_BUCKET, Key: templateKey };
         const templateObject = await s3Client.send(new GetObjectCommand(getObjectParams));
-        const templateBuffer = await templateObject.Body.transformToByteArray();
+        const templateZipBuffer = await templateObject.Body.transformToByteArray();
 
-        const metadata = await sharp(templateBuffer).metadata();
+        // 2. Unzip, find the PNG, and edit it with Sharp
+        const zip = await JSZip.loadAsync(templateZipBuffer);
+        const templatePngFile = zip.file(/template\.png$/)[0];
+        if (!templatePngFile) {
+            throw new Error(`template.png not found in ${templateKey}`);
+        }
+        const templatePngBytes = await templatePngFile.async('uint8array');
+
+        // Edit the image with Sharp using your preferred style
+        const metadata = await sharp(templatePngBytes).metadata();
         const svgText = `
           <svg width="${metadata.width}" height="${metadata.height}">
             <style>
               .title { 
-                fill: #f0cc00;
+                fill: #f0cc00; 
+                font-size: 980px; 
+                font-weight: bold; 
                 font-family: Helvetica;
-                font-size: 980px;
-                font-weight: bold;
-                letter-spacing: 3px;
+                letter-spacing: 5px;
               }
             </style>
-            <text 
-              x="50%" 
-              y="50%" 
-              text-anchor="middle" 
-              dominant-baseline="middle" 
-              class="title">${callSign}</text>
-          </svg>
-        `;
+            <text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" dy=".05em" class="title">${callSign}</text>
+          </svg>`;
         const svgBuffer = Buffer.from(svgText);
 
-        const finishedImageBuffer = await sharp(templateBuffer)
+        const finishedImageBuffer = await sharp(templatePngBytes)
           .composite([{ input: svgBuffer }])
           .png()
           .toBuffer();
         console.log('✅ Image processing with sharp complete.');
 
-        // const newImageKey = `designs/${payload.name}-${item.id}-${Date.now()}.png`;
-        const newImageKey = `designs/${payload.name.replace('#', '')}-${item.id}-${Date.now()}.png`;
+        // 3. Create a new ZIP file with the edited PNG
+        const newZip = new JSZip();
+        // Add all files from the original zip EXCEPT the old template.png
+        for (const [relativePath, file] of Object.entries(zip.files)) {
+            if (!relativePath.endsWith('template.png')) {
+                newZip.file(relativePath, await file.async('uint8array'));
+            }
+        }
+        // Add the new, edited PNG
+        newZip.file('design.png', finishedImageBuffer);
+        const finalZipBuffer = await newZip.generateAsync({ type: 'nodebuffer' });
+        console.log('✅ New ZIP package created.');
+
+        // 4. Upload the final ZIP to the "designs" S3 bucket
+        const newImageKey = `designs/${payload.name.replace('#', '')}-${item.id}-${Date.now()}.zip`;
         const putObjectParams = {
           Bucket: process.env.AWS_DESIGNS_BUCKET,
           Key: newImageKey,
-          Body: finishedImageBuffer,
-          ContentType: 'image/png',
+          Body: finalZipBuffer,
+          ContentType: 'application/zip',
         };
         await s3Client.send(new PutObjectCommand(putObjectParams));
         
         const newImageUrl = `https://${process.env.AWS_DESIGNS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${newImageKey}`;
-        console.log(`✅ Uploaded new image to S3: ${newImageUrl}`);
+        console.log(`✅ Uploaded new ZIP to S3: ${newImageUrl}`);
 
         const orderName = payload.name;
         designLinks.push(`${orderName}-${itemIndex}/${totalCustomItems}-${newImageUrl};`);
       }
     }
 
+    // 5. Update the Shopify order note
     if (designLinks.length > 0) {
-      console.log('Updating order with S3 links...');
-      const newNote = (payload.note ? `${payload.note}\n\n` : '') + `--- Custom Design Files ---\n${designLinks.join('\n')}`;
-      const gqlClient = new shopify.clients.Graphql({ session: { shop, accessToken: process.env.SHOPIFY_ACCESS_TOKEN } });
-      
-      await gqlClient.request(
+      console.log('Found custom designs. Updating order with tags and notes...');
+
+      const newNote =
+        (payload.note ? `${payload.note}\n\n` : "") +
+        `--- Custom Design Files ---\n${designLinks.join("\n")}`;
+
+      const client = new shopify.clients.Graphql({
+        session: { shop, accessToken: process.env.SHOPIFY_ACCESS_TOKEN },
+      });
+
+      const response = await client.request(
         `mutation addTagsAndUpdateNote($id: ID!, $tags: [String!]!, $note: String!) {
-          tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
-          orderUpdate(input: {id: $id, note: $note}) { order { id } userErrors { field message } }
+            tagsAdd(id: $id, tags: $tags) {
+            node { id }
+            userErrors { field message }
+            }
+            orderUpdate(input: {id: $id, note: $note}) {
+            order { id }
+            userErrors { field message }
+            }
         }`,
-        { variables: { id: payload.admin_graphql_api_id, tags: ['has_custom_design'], note: newNote } }
+        {
+          variables: {
+            id: payload.admin_graphql_api_id,
+            tags: ["has_custom_design"],
+            note: newNote,
+          },
+        }
       );
-      console.log(`✅ Successfully updated order ${payload.id} with tags and notes.`);
+
+      // Add detailed logging for the final step
+      if (response.data.tagsAdd.userErrors.length > 0 || response.data.orderUpdate.userErrors.length > 0) {
+          console.error("❌ Shopify API returned errors when updating order:", {
+              tagsAddErrors: response.data.tagsAdd.userErrors,
+              orderUpdateErrors: response.data.orderUpdate.userErrors
+          });
+      } else {
+          console.log(`✅ Successfully updated order ${payload.id} with tags and notes.`);
+      }
     }
   } catch (error) {
     console.error("❌ An error occurred:", error);
@@ -192,6 +237,6 @@ app.post('/webhooks', express.raw({ type: 'application/json' }), async (req, res
 // --- SERVER STARTUP ---
 app.listen(process.env.PORT, async () => {
   console.log(`🚀 Server is listening on http://localhost:${process.env.PORT}`);
-  console.log("Attempting to register webhook...");
-  await registerWebhook(process.env.SHOP_URL, process.env.SHOPIFY_ACCESS_TOKEN);
+  // console.log("Attempting to register webhook...");
+  // await registerWebhook(process.env.SHOP_URL, process.env.SHOPIFY_ACCESS_TOKEN); //commented out for production deployment
 });
