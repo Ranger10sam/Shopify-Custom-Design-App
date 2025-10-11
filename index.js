@@ -237,6 +237,6 @@ app.post('/webhooks', express.raw({ type: 'application/json' }), async (req, res
 // --- SERVER STARTUP ---
 app.listen(process.env.PORT, async () => {
   console.log(`🚀 Server is listening on http://localhost:${process.env.PORT}`);
-  // console.log("Attempting to register webhook...");
-  // await registerWebhook(process.env.SHOP_URL, process.env.SHOPIFY_ACCESS_TOKEN); //commented out for production deployment
+  console.log("Attempting to register webhook...");
+  await registerWebhook(process.env.SHOP_URL, process.env.SHOPIFY_ACCESS_TOKEN);
 });
