@@ -26,40 +26,79 @@ const s3Client = new S3Client({
 });
 
 // --- CORE PROCESSING LOGIC (Now identical to your live app's webhookHandler) ---
+// --- REUSABLE CORE LOGIC (Updated with new tag format) ---
 async function processOrderPayload(payload, shop) {
   try {
     const designLinks = [];
+    // This array will hold all our tags
+    const dynamicTags = ['has_custom_design', 'manual_recovery'];
     let itemIndex = 0;
-    const totalCustomItems = payload.line_items.filter(i => i.properties?.some(p => p.name === 'call_sign')).length;
+    const totalCustomItems = payload.line_items.filter((i) =>
+      i.properties?.some((p) => p.name === "call_sign")
+    ).length;
 
     for (const item of payload.line_items) {
-      const prop = item.properties?.find(p => p.name === 'call_sign');
+      const prop = item.properties?.find((p) => p.name === "call_sign");
       if (prop?.value) {
         itemIndex++;
-        const callSign = prop.value;
-        console.log(`  -> Found Custom Item: "${item.title}" with Call Sign "${callSign}"`);
+        const callSign = prop.value; // Get the exact call sign
+        console.log(
+          `  -> Found Custom Item: "${item.title}" with Call Sign "${callSign}"`
+        );
+
+        // --- START: NEW TAG LOGIC ---
+        
+        // Split the variant title (e.g., "White / 2XL") into parts
+        const variantParts = item.variant_title.split(' / ');
+        const variantColor = variantParts[0] ? variantParts[0].trim() : 'UnknownColor';
+        const variantSize = variantParts[1] ? variantParts[1].trim() : 'UnknownSize';
+
+        // Create the new tag in the format: Title/Color/Size/CallSign
+        // We do NOT trim the callSign, as requested, to preserve user-entered spaces
+        //const newTag = `${item.title}/${variantColor}/${variantSize}/${callSign}`;
+        const newTag = `${variantColor}/${variantSize}/${callSign}`;
+        
+        // Add the new tag for each item
+        dynamicTags.push(newTag);
+        
+        // --- END: NEW TAG LOGIC ---
+
 
         // 1. Construct and download the template ZIP from S3
-        const baseFilename = item.title.toUpperCase().replace(/\s+/g, '_').replace('-', '--');
-        const variantTitle = item.variant_title.toLowerCase();
+        const baseFilename = item.title
+          .toUpperCase()
+          .replace(/\s+/g, "_")
+          .replace("T-SHIRT", "T--SHIRT");
+        const variantTitle = item.variant_title.toLowerCase(); // This is just for the filename
         let templateKey;
-        if (variantTitle.includes('white') || variantTitle.includes('golden yellow')) {
+        if (
+          variantTitle.includes("white") ||
+          variantTitle.includes("golden yellow")
+        ) {
           templateKey = `${baseFilename}_FOR_LIGHT.zip`;
         } else {
           templateKey = `${baseFilename}_FOR_DARK.zip`;
         }
         console.log(`     - Searching for template ZIP: ${templateKey}`);
 
-        const getObjectParams = { Bucket: process.env.AWS_TEMPLATES_BUCKET, Key: templateKey };
-        const templateObject = await s3Client.send(new GetObjectCommand(getObjectParams));
+        const getObjectParams = {
+          Bucket: process.env.AWS_TEMPLATES_BUCKET,
+          Key: templateKey,
+        };
+        const templateObject = await s3Client.send(
+          new GetObjectCommand(getObjectParams)
+        );
         const templateZipBuffer = await templateObject.Body.transformToByteArray();
 
         // 2. Unzip, find the PNG, and edit it with Sharp
         const zip = await JSZip.loadAsync(templateZipBuffer);
         const templatePngFile = zip.file(/template\.png$/)[0];
-        if (!templatePngFile) { throw new Error(`template.png not found in ${templateKey}`); }
-        const templatePngBytes = await templatePngFile.async('uint8array');
+        if (!templatePngFile) {
+          throw new Error(`template.png not found in ${templateKey}`);
+        }
+        const templatePngBytes = await templatePngFile.async("uint8array");
 
+        // Edit the image with Sharp using your preferred style
         const metadata = await sharp(templatePngBytes).metadata();
         const svgText = `
           <svg width="${metadata.width}" height="${metadata.height}">
@@ -75,50 +114,79 @@ async function processOrderPayload(payload, shop) {
             <text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" dy=".05em" class="title">${callSign}</text>
           </svg>`;
         const svgBuffer = Buffer.from(svgText);
-        const finishedImageBuffer = await sharp(templatePngBytes).composite([{ input: svgBuffer }]).png().toBuffer();
-        console.log('     - Image processing complete.');
+
+        const finishedImageBuffer = await sharp(templatePngBytes)
+          .composite([{ input: svgBuffer }])
+          .png()
+          .toBuffer();
+        console.log("     - Image processing complete.");
 
         // 3. Create a new ZIP file with the edited PNG
         const newZip = new JSZip();
         for (const [relativePath, file] of Object.entries(zip.files)) {
-            if (!relativePath.endsWith('template.png')) {
-                newZip.file(relativePath, await file.async('uint8array'));
-            }
+          if (!relativePath.endsWith("template.png")) {
+            newZip.file(relativePath, await file.async("uint8array"));
+          }
         }
-        newZip.file('design.png', finishedImageBuffer);
-        const finalZipBuffer = await newZip.generateAsync({ type: 'nodebuffer' });
-        console.log('     - New ZIP package created.');
-        
-        // 4. Upload the final ZIP to S3
-        const newZipKey = `designs/${payload.name.replace('#', '')}-${item.id}-${Date.now()}.zip`;
-        const putObjectParams = { Bucket: process.env.AWS_DESIGNS_BUCKET, Key: newZipKey, Body: finalZipBuffer, ContentType: 'application/zip' };
+        newZip.file("design.png", finishedImageBuffer);
+        const finalZipBuffer = await newZip.generateAsync({ type: "nodebuffer" });
+        console.log("     - New ZIP package created.");
+
+        // 4. Upload the final ZIP to the "designs" S3 bucket
+        const newZipKey = `designs/${payload.name.replace("#", "")}-${
+          item.id
+        }-${Date.now()}.zip`;
+        const putObjectParams = {
+          Bucket: process.env.AWS_DESIGNS_BUCKET,
+          Key: newZipKey,
+          Body: finalZipBuffer,
+          ContentType: "application/zip",
+        };
         await s3Client.send(new PutObjectCommand(putObjectParams));
         const newFileUrl = `https://${process.env.AWS_DESIGNS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${newZipKey}`;
         console.log(`     - Uploaded new ZIP to S3: ${newFileUrl}`);
 
         const orderName = payload.name;
-        designLinks.push(`${orderName}-${itemIndex}/${totalCustomItems}-${newFileUrl};`);
+        designLinks.push(
+          `${orderName}-${itemIndex}/${totalCustomItems}-${newFileUrl};`
+        );
       }
     }
 
     // 5. Update the Shopify order note
     if (designLinks.length > 0) {
-      console.log('  -> Updating Shopify order with tags and notes...');
-      const newNote = (payload.note ? `${payload.note}\n\n` : "") + `--- Custom Design Files (Manual Recovery) ---\n${designLinks.join("\n")}`;
-      const gqlClient = new shopify.clients.Graphql({ session: { shop, accessToken: process.env.SHOPIFY_ACCESS_TOKEN } });
+      console.log("  -> Updating Shopify order with tags and notes...");
+      const newNote =
+        (payload.note ? `${payload.note}\n\n` : "") +
+        `--- Custom Design Files (Manual Recovery) ---\n${designLinks.join(
+          "\n"
+        )}`;
+      const gqlClient = new shopify.clients.Graphql({
+        session: { shop, accessToken: process.env.SHOPIFY_ACCESS_TOKEN },
+      });
       await gqlClient.request(
         `mutation addTagsAndUpdateNote($id: ID!, $tags: [String!]!, $note: String!) {
           tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
           orderUpdate(input: {id: $id, note: $note}) { order { id } userErrors { field message } }
         }`,
-        { variables: { id: payload.admin_graphql_api_id, tags: ['has_custom_design', 'manual_recovery'], note: newNote } }
+        {
+          variables: {
+            id: payload.admin_graphql_api_id,
+            // --- UPDATED: Use the dynamic array ---
+            tags: dynamicTags,
+            note: newNote,
+          },
+        }
       );
       console.log(`  -> ✅ Successfully updated order ${payload.name}.`);
     } else {
-        console.log('  -> No custom items found in this order.');
+      console.log("  -> No custom items found in this order.");
     }
   } catch (error) {
-    console.error(`  -> ❌ An error occurred while processing order ${payload.name}:`, error);
+    console.error(
+      `  -> ❌ An error occurred while processing order ${payload.name}:`,
+      error.message // Changed to error.message for cleaner logs
+    );
   }
 }
 
