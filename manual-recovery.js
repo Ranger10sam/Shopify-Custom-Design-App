@@ -27,6 +27,7 @@ const s3Client = new S3Client({
 
 // --- CORE PROCESSING LOGIC (Now identical to your live app's webhookHandler) ---
 // --- REUSABLE CORE LOGIC (Updated with new tag format) ---
+// --- REUSABLE CORE LOGIC (Updated with conditional link formatting) ---
 async function processOrderPayload(payload, shop) {
   try {
     const designLinks = [];
@@ -53,9 +54,7 @@ async function processOrderPayload(payload, shop) {
         const variantColor = variantParts[0] ? variantParts[0].trim() : 'UnknownColor';
         const variantSize = variantParts[1] ? variantParts[1].trim() : 'UnknownSize';
 
-        // Create the new tag in the format: Title/Color/Size/CallSign
-        // We do NOT trim the callSign, as requested, to preserve user-entered spaces
-        //const newTag = `${item.title}/${variantColor}/${variantSize}/${callSign}`;
+        // Create the new tag in the format: Color/Size/CallSign
         const newTag = `${variantColor}/${variantSize}/${callSign}`;
         
         // Add the new tag for each item
@@ -143,17 +142,27 @@ async function processOrderPayload(payload, shop) {
           ContentType: "application/zip",
         };
         await s3Client.send(new PutObjectCommand(putObjectParams));
-        const newFileUrl = `https://${process.env.AWS_DESIGNS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${newZipKey}`;
+        const newFileUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${process.env.AWS_DESIGNS_BUCKET}/${newZipKey}`;
         console.log(`     - Uploaded new ZIP to S3: ${newFileUrl}`);
 
         const orderName = payload.name;
-        designLinks.push(
-          `${orderName}-${itemIndex}/${totalCustomItems}-${newFileUrl};`
-        );
+        
+        // --- START: NEW CONDITIONAL LINK LOGIC ---
+        let designLinkString;
+        if (totalCustomItems > 1) {
+          // Multi-item order: Use the full format
+          designLinkString = `${orderName}-${itemIndex}/${totalCustomItems}-${newFileUrl};`;
+        } else {
+          // Single-item order: Use the simplified format (no 1/1)
+          designLinkString = `${orderName}-${newFileUrl};`;
+        }
+        // --- END: NEW CONDITIONAL LINK LOGIC ---
+
+        designLinks.push(designLinkString);
       }
     }
 
-    // 5. Update the Shopify order note
+    // 5. Update the Shopify order note (with error checking)
     if (designLinks.length > 0) {
       console.log("  -> Updating Shopify order with tags and notes...");
       const newNote =
@@ -164,7 +173,8 @@ async function processOrderPayload(payload, shop) {
       const gqlClient = new shopify.clients.Graphql({
         session: { shop, accessToken: process.env.SHOPIFY_ACCESS_TOKEN },
       });
-      await gqlClient.request(
+      
+      const response = await gqlClient.request(
         `mutation addTagsAndUpdateNote($id: ID!, $tags: [String!]!, $note: String!) {
           tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
           orderUpdate(input: {id: $id, note: $note}) { order { id } userErrors { field message } }
@@ -172,20 +182,32 @@ async function processOrderPayload(payload, shop) {
         {
           variables: {
             id: payload.admin_graphql_api_id,
-            // --- UPDATED: Use the dynamic array ---
             tags: dynamicTags,
             note: newNote,
           },
         }
       );
-      console.log(`  -> ✅ Successfully updated order ${payload.name}.`);
+
+      // --- Proper Error Checking ---
+      const tagsErrors = response.data?.tagsAdd?.userErrors || [];
+      const orderUpdateErrors = response.data?.orderUpdate?.userErrors || [];
+
+      if (tagsErrors.length > 0 || orderUpdateErrors.length > 0) {
+        console.error("  -> ❌ Shopify API returned errors when updating order:", {
+          tagsErrors,
+          orderUpdateErrors,
+        });
+      } else {
+        console.log(`  -> ✅ Successfully updated order ${payload.name}.`);
+      }
+      
     } else {
       console.log("  -> No custom items found in this order.");
     }
   } catch (error) {
     console.error(
       `  -> ❌ An error occurred while processing order ${payload.name}:`,
-      error.message // Changed to error.message for cleaner logs
+      error.message
     );
   }
 }
